@@ -1,0 +1,199 @@
+---
+title: "Prophet Forecasting Cross-Check vs Driver-Based Model"
+subtitle: "AI-Driven FP&A Dashboard — Chapter 4 Supporting Analysis"
+author: "Nandan K R"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, fig.width = 8, fig.height = 4.5)
+
+required_pkgs <- c("readxl", "dplyr", "tidyr", "prophet", "ggplot2", "purrr", "DT", "knitr", "kableExtra")
+missing_pkgs <- required_pkgs[!sapply(required_pkgs, requireNamespace, quietly = TRUE)]
+if (length(missing_pkgs) > 0) {
+  stop("Missing packages: ", paste(missing_pkgs, collapse = ", "),
+       "\nRun: install.packages(c(", paste0('"', missing_pkgs, '"', collapse = ", "), "))")
+}
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(prophet)
+library(ggplot2)
+library(purrr)
+library(DT)
+library(knitr)
+library(kableExtra)
+
+set.seed(42)
+```
+
+## 1. Overview
+
+This report cross-checks the Excel driver-based FP&A forecast (FY2026-27 to FY2030-31) against an independently fitted **Prophet** trend model built on the same six years of actuals (FY2020-21 to FY2025-26), for Revenue, EBITDA, and PAT across all five companies. Because Prophet is run on only six annual points, seasonality is switched off and changepoint flexibility is kept conservative — Prophet is functioning here as a **robust trend-validation check**, not a full seasonal forecast.
+
+```{r load-data}
+raw <- read_excel("C:/Users/nkr71/Downloads/IIP/Project_1.xlsx", sheet = "Financial Modeling (2)", skip = 1)
+
+data <- raw %>%
+  select(Company, `Financial Year`, `Revenue (Turnover)`, EBITDA, PAT) %>%
+  rename(Revenue = `Revenue (Turnover)`) %>%
+  filter(!is.na(Company))
+
+fy_to_date <- function(fy) {
+  start_yr <- as.integer(substr(fy, 3, 6))
+  as.Date(paste0(start_yr + 1, "-03-31"))
+}
+
+data <- data %>% mutate(ds = fy_to_date(`Financial Year`))
+
+actual_years   <- paste0("FY", 2020:2025, "-", sprintf("%02d", (21:26) %% 100))
+forecast_years <- paste0("FY", 2026:2030, "-", sprintf("%02d", (27:31) %% 100))
+
+actuals   <- data %>% filter(`Financial Year` %in% actual_years)
+driver_fc <- data %>% filter(`Financial Year` %in% forecast_years) %>%
+  rename(Revenue_Driver = Revenue, EBITDA_Driver = EBITDA, PAT_Driver = PAT) %>%
+  select(Company, `Financial Year`, ds, Revenue_Driver, EBITDA_Driver, PAT_Driver)
+
+companies <- unique(actuals$Company)
+metrics   <- c("Revenue", "EBITDA", "PAT")
+```
+
+```{r fit-functions}
+fit_prophet_model <- function(df) {
+  prophet(
+    df, growth = "linear",
+    yearly.seasonality = FALSE, weekly.seasonality = FALSE, daily.seasonality = FALSE,
+    n.changepoints = 2, changepoint.prior.scale = 0.05, interval.width = 0.80
+  )
+}
+
+run_prophet <- function(company, metric) {
+  tryCatch({
+    df <- actuals %>% filter(Company == company) %>% transmute(ds = ds, y = .data[[metric]])
+    m <- fit_prophet_model(df)
+    future <- make_future_dataframe(m, periods = 5, freq = "year")
+    fcst <- predict(m, future)
+    fcst %>% mutate(ds = as.Date(ds)) %>% filter(ds > max(df$ds)) %>%
+      transmute(Company = company, Metric = metric, ds,
+                Prophet_Forecast = yhat, Prophet_Lower = yhat_lower, Prophet_Upper = yhat_upper)
+  }, error = function(e) {
+    tibble(Company = company, Metric = metric, ds = as.Date(NA),
+           Prophet_Forecast = NA, Prophet_Lower = NA, Prophet_Upper = NA)
+  })
+}
+
+run_loocv <- function(company, metric) {
+  df <- actuals %>% filter(Company == company) %>%
+    transmute(ds = ds, y = .data[[metric]]) %>% arrange(ds)
+  preds <- map_dfr(seq_len(nrow(df)), function(i) {
+    tryCatch({
+      train <- df[-i, ]
+      m <- fit_prophet_model(train)
+      fc <- predict(m, df[i, "ds", drop = FALSE])
+      tibble(ds = df$ds[i], actual = df$y[i], predicted = fc$yhat)
+    }, error = function(e) tibble(ds = df$ds[i], actual = df$y[i], predicted = NA))
+  })
+  tibble(Company = company, Metric = metric,
+         MAPE_pct = round(mean(abs((preds$actual - preds$predicted) / preds$actual), na.rm = TRUE) * 100, 2),
+         RMSE = round(sqrt(mean((preds$actual - preds$predicted)^2, na.rm = TRUE)), 1))
+}
+```
+
+```{r run-models, include=FALSE}
+results <- map_dfr(companies, function(co) map_dfr(metrics, function(me) run_prophet(co, me)))
+accuracy_summary <- map_dfr(companies, function(co) map_dfr(metrics, function(me) run_loocv(co, me)))
+
+comparison <- results %>%
+  pivot_wider(names_from = Metric, values_from = c(Prophet_Forecast, Prophet_Lower, Prophet_Upper)) %>%
+  left_join(driver_fc, by = c("Company", "ds")) %>%
+  mutate(
+    Var_Revenue_pct = round((Prophet_Forecast_Revenue - Revenue_Driver) / Revenue_Driver * 100, 2),
+    Var_EBITDA_pct  = round((Prophet_Forecast_EBITDA  - EBITDA_Driver)  / EBITDA_Driver  * 100, 2),
+    Var_PAT_pct     = round((Prophet_Forecast_PAT     - PAT_Driver)     / PAT_Driver     * 100, 2),
+    Flag_Revenue = ifelse(abs(Var_Revenue_pct) > 15, "REVIEW", ""),
+    Flag_EBITDA  = ifelse(abs(Var_EBITDA_pct)  > 15, "REVIEW", ""),
+    Flag_PAT     = ifelse(abs(Var_PAT_pct)     > 15, "REVIEW", "")
+  ) %>%
+  select(Company, `Financial Year`, ds,
+         Revenue_Driver, Prophet_Forecast_Revenue, Var_Revenue_pct, Flag_Revenue,
+         EBITDA_Driver, Prophet_Forecast_EBITDA, Var_EBITDA_pct, Flag_EBITDA,
+         PAT_Driver, Prophet_Forecast_PAT, Var_PAT_pct, Flag_PAT) %>%
+  arrange(Company, ds)
+
+company_summary <- comparison %>%
+  group_by(Company) %>%
+  summarise(
+    Avg_Abs_Variance_pct = round(mean(abs(c(Var_Revenue_pct, Var_EBITDA_pct, Var_PAT_pct)), na.rm = TRUE), 2),
+    Max_Abs_Variance_pct = round(max(abs(c(Var_Revenue_pct, Var_EBITDA_pct, Var_PAT_pct)), na.rm = TRUE), 2),
+    Flags_Raised = sum(Flag_Revenue == "REVIEW", Flag_EBITDA == "REVIEW", Flag_PAT == "REVIEW")
+  ) %>%
+  arrange(desc(Avg_Abs_Variance_pct))
+```
+
+## 2. Prophet In-Sample Accuracy (Leave-One-Out CV)
+
+With only six annual points per series there is no genuine holdout period, so accuracy is checked by leave-one-out cross-validation: fit on five years, predict the excluded year, repeat for all six. Lower MAPE/RMSE indicates a more reliable trend fit for that company/metric.
+
+```{r accuracy-table}
+datatable(accuracy_summary, options = list(pageLength = 15, dom = 't'), rownames = FALSE) %>%
+  formatStyle('MAPE_pct', backgroundColor = styleInterval(c(5, 10), c('#d4edda', '#fff3cd', '#f8d7da')))
+```
+
+## 3. Company-Level Divergence Summary
+
+Ranked by average absolute variance between the Prophet cross-check and the Excel driver-based forecast, across Revenue, EBITDA and PAT.
+
+```{r summary-table}
+kable(company_summary, format = "html", caption = "Higher values indicate greater divergence between the two forecasting methods") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE) %>%
+  row_spec(which(company_summary$Flags_Raised > 0), background = "#fff3cd")
+```
+
+## 4. Full Forecast Comparison Table
+
+Driver-based (Excel) vs Prophet forecast, FY2026-27 to FY2030-31. Rows flagged **REVIEW** where the two methods diverge by more than 15%.
+
+```{r comparison-table}
+datatable(comparison, options = list(pageLength = 10, scrollX = TRUE), rownames = FALSE) %>%
+  formatStyle('Flag_Revenue', backgroundColor = styleEqual("REVIEW", "#f8d7da")) %>%
+  formatStyle('Flag_EBITDA',  backgroundColor = styleEqual("REVIEW", "#f8d7da")) %>%
+  formatStyle('Flag_PAT',     backgroundColor = styleEqual("REVIEW", "#f8d7da"))
+```
+
+## 5. Forecast Charts — Actual vs Driver-Based vs Prophet
+
+```{r plots, results='asis'}
+for (co in companies) {
+  cat("###", co, "\n\n")
+  for (me in metrics) {
+    act <- actuals %>% filter(Company == co) %>% transmute(ds, value = .data[[me]], series = "Actual")
+    driver_col <- paste0(me, "_Driver")
+    drv <- driver_fc %>% filter(Company == co) %>%
+      transmute(ds, value = .data[[driver_col]], series = "Driver-based (Excel)")
+    proph <- results %>% filter(Company == co, Metric == me) %>%
+      transmute(ds, value = Prophet_Forecast, series = "Prophet")
+    plot_df <- bind_rows(act, drv, proph)
+
+    p <- ggplot(plot_df, aes(x = ds, y = value, color = series, linetype = series)) +
+      geom_line(linewidth = 0.9) + geom_point(size = 1.8) +
+      labs(title = paste(me), x = NULL, y = me, color = NULL, linetype = NULL) +
+      theme_minimal(base_size = 11) + theme(legend.position = "bottom")
+    print(p)
+    cat("\n\n")
+  }
+}
+```
+
+## 6. Reproducibility
+
+```{r session-info}
+Sys.time()
+sessionInfo()
+```
